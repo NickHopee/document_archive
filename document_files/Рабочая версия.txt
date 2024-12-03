@@ -1,0 +1,1275 @@
+import flet as ft
+from datetime import datetime
+import os
+from typing import Optional, Dict, List
+from dataclasses import dataclass
+from pathlib import Path
+import fitz 
+import tempfile
+from PIL import Image
+import io
+
+@dataclass
+class Document:
+    """Класс для представления документа"""
+    def __init__(self, title, file_path, status, created_date, author):
+        self.name = title  # Явно задаем атрибут name
+        self.title = title
+        self.file_path = file_path
+        self.status = status
+        self.created_date = created_date
+        self.author = author
+        self.version = 1
+        self.history = []
+
+@dataclass
+class User:
+    username: str
+    role: str
+    password: str
+    
+    @property
+    def is_admin(self) -> bool:
+        return self.role == "admin"
+    
+    @property
+    def is_editor(self) -> bool:
+        return self.role in ["admin", "editor"]
+
+class FolderTree:
+    def __init__(self, app):
+        self.app = app
+        self.expanded_paths = set()
+
+    def create_folder_item(self, name: str, path: str, is_root: bool = False, level: int = 0) -> ft.Container:
+        """Создание элемента папки с выделением"""
+        is_expanded = path in self.expanded_paths
+        is_selected = path == self.app.current_folder
+        has_subfolders = bool(self.app.folders[path]["subfolders"])
+        
+        def toggle_expand(e):
+            if path in self.expanded_paths:
+                self.expanded_paths.remove(path)
+            else:
+                self.expanded_paths.add(path)
+            self.app.update_folder_tree()
+            
+        def show_folder_menu(e):
+            self.app.show_folder_menu(e, path)
+
+        # Настройки текста
+        text_size = 16 if is_root else 14
+        text_weight = ft.FontWeight.BOLD if is_root or is_selected else ft.FontWeight.NORMAL
+        text_color = ft.colors.WHITE if is_selected else None
+
+        # Настройки иконок
+        icon_color = ft.colors.WHITE if is_selected else (ft.colors.BLUE if is_root else ft.colors.GREY_700)
+
+        # Расчет отступов
+        base_indent = 8
+        level_indent = 16
+        total_indent = level * level_indent + base_indent
+
+        folder_row = ft.Row(
+            [
+                ft.Container(width=total_indent),
+                ft.IconButton(
+                    icon=ft.icons.EXPAND_MORE if is_expanded else ft.icons.CHEVRON_RIGHT,
+                    on_click=toggle_expand,
+                    icon_size=16,
+                    icon_color=icon_color,
+                    visible=has_subfolders,
+                    style=ft.ButtonStyle(
+                        padding=ft.padding.all(0),
+                    ),
+                ),
+                ft.Icon(
+                    name=ft.icons.FOLDER_OPEN if is_expanded else ft.icons.FOLDER,
+                    size=16,
+                    color=icon_color,
+                ),
+                ft.Text(
+                    name,
+                    size=text_size,
+                    color=text_color,
+                    weight=text_weight,
+                ),
+                ft.IconButton(
+                    icon=ft.icons.MORE_VERT,
+                    icon_size=16,
+                    icon_color=icon_color,
+                    on_click=show_folder_menu,
+                    style=ft.ButtonStyle(
+                        padding=ft.padding.all(0),
+                    ),
+                ),
+            ],
+            spacing=4,
+            alignment=ft.MainAxisAlignment.START,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        )
+
+        return ft.Container(
+            content=folder_row,
+            data=path,
+            bgcolor=ft.colors.BLUE_700 if is_selected else None,
+            border_radius=5,
+            padding=ft.padding.only(left=0, top=5, right=10, bottom=5),
+            ink=True,
+            on_click=lambda e: self.app.select_folder(path),
+        )
+
+class ArchiveApp:
+    def __init__(self):
+        self.documents = {}
+        self.users = {"admin": User("admin", "admin", "admin")}
+        self.current_user = None
+        self.current_folder = None  # Изначально нет текущей папки
+        self.statuses = ["Активный", "В обработке", "Архивный", "Удален"]
+        self.folder_tree = None
+        # Инициализируем пустую структуру папок
+        self.folders = {}
+        self.preview_panel = None
+        self.current_document = None
+        self.supported_previews = {
+            ".txt": self.text_preview,
+            ".pdf": self.pdf_preview,
+            ".jpg": self.image_preview,
+            ".jpeg": self.image_preview,
+            ".png": self.image_preview,
+            ".docx": self.docx_preview,
+            # Можно добавить другие форматы
+        }
+        
+    def authenticate(self, username: str, password: str) -> bool:
+        """Аутентификация пользователя"""
+        user = self.users.get(username)
+        if user and user.password == password:
+            self.current_user = user
+            return True
+        return False
+
+    def show_error(self, message: str):
+        """Показ сообщения об ошибке"""
+        if hasattr(self, 'page'):
+            self.page.show_snack_bar(
+                ft.SnackBar(content=ft.Text(message), bgcolor=ft.colors.ERROR)
+            )
+
+    def show_login_dialog(self):
+        """Показ диалога входа"""
+        def try_login(e):
+            username = username_field.value
+            password = password_field.value
+            if self.authenticate(username, password):
+                dialog.open = False
+                self.page.update()
+                self.create_main_ui()
+            else:
+                self.show_error("Неверное имя пользователя или пароль")
+
+        username_field = ft.TextField(label="Имя пользователя")
+        password_field = ft.TextField(label="Пароль", password=True)
+        
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Вход в систему"),
+            content=ft.Column([username_field, password_field]),
+            actions=[ft.TextButton("Войти", on_click=try_login)]
+        )
+        
+        self.page.overlay.append(dialog)
+        dialog.open = True
+        self.page.update()
+
+    def create_main_ui(self):
+        """Создание основного интерфейса"""
+        # Левая панель с деревом папок
+        self.folder_list = ft.ListView(expand=1, spacing=0, padding=10)
+        self.folder_tree = FolderTree(self)
+        
+        left_panel = ft.Container(
+            content=ft.Column([
+                ft.ElevatedButton(
+                    "Создать корневую папку",
+                    icon=ft.icons.CREATE_NEW_FOLDER_OUTLINED,
+                    on_click=lambda _: self.add_root_folder_dialog()
+                ),
+                ft.Divider(),
+                self.folder_list
+            ]),
+            width=300,
+            padding=10
+        )
+
+        # Центральная панель со списком документов
+        self.document_list = ft.ListView(expand=1, spacing=2, padding=10)
+        
+        center_panel = ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    ft.Text("Документы", size=20, weight=ft.FontWeight.BOLD),
+                    ft.IconButton(
+                        icon=ft.icons.ADD,
+                        tooltip="Добавить документ",
+                        on_click=lambda _: self.add_document_dialog()
+                    )
+                ]),
+                ft.Divider(),
+                self.document_list
+            ]),
+            expand=True,
+            padding=10
+        )
+
+        # Правая панель предпросмотра
+        self.preview_panel = ft.Container(
+            content=ft.Column([
+                ft.Text("Выберите документ для просмотра", 
+                       color=ft.colors.GREY_500,
+                       text_align=ft.TextAlign.CENTER),
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+            width=400,
+            bgcolor=ft.colors.BACKGROUND,
+            border=ft.border.all(1, ft.colors.OUTLINE),
+            border_radius=10,
+            padding=20
+        )
+
+        # Компоновка панелей
+        self.page.add(
+            ft.Row([
+                left_panel,
+                ft.VerticalDivider(),
+                center_panel,
+                ft.VerticalDivider(),
+                self.preview_panel
+            ], expand=True)
+        )
+
+    def show_preview(self, document):
+        """Показать превью документа"""
+        try:
+            preview_content = ft.Column([
+                # Информация о документе
+                ft.Row([
+                    ft.Icon(ft.icons.DESCRIPTION, size=24),
+                    ft.Text(document.name if hasattr(document, 'name') else document.title,
+                           size=16, weight=ft.FontWeight.BOLD),
+                ]),
+                
+                # Метаданные документа
+                ft.Container(
+                    content=ft.Column([
+                        ft.Text(f"Статус: {document.status}", size=14),
+                        ft.Text(f"Создан: {document.created_date}", size=14),
+                        ft.Text(f"Автор: {document.author}", size=14),
+                        ft.Text(f"Версия: {document.version}", size=14),
+                    ]),
+                    bgcolor=ft.colors.SURFACE_VARIANT,
+                    padding=10,
+                    border_radius=5,
+                ),
+                
+                ft.Divider(),
+            ], spacing=10)
+
+            # Добавляем превью содержимого в зависимости от типа файла
+            if hasattr(document, 'file_path') and document.file_path:
+                file_ext = os.path.splitext(document.file_path)[1].lower()
+                if file_ext in self.supported_previews:
+                    preview_content.controls.extend(
+                        self.supported_previews[file_ext](document)
+                    )
+                else:
+                    preview_content.controls.append(
+                        ft.Text("Предпросмотр для данного типа файла не поддерживается")
+                    )
+            else:
+                preview_content.controls.append(
+                    ft.Text("Файл не прикреплен к документу")
+                )
+
+            # Добавляем кнопки действий
+            preview_content.controls.extend([
+                ft.Divider(),
+                ft.Row([
+                    ft.ElevatedButton(
+                        "Открыть",
+                        icon=ft.icons.OPEN_IN_NEW,
+                        on_click=lambda _: self.open_document(document)
+                    ),
+                    ft.OutlinedButton(
+                        "Скачать",
+                        icon=ft.icons.DOWNLOAD,
+                        on_click=lambda _: self.download_document(document)
+                    ),
+                ], alignment=ft.MainAxisAlignment.CENTER)
+            ])
+
+            self.preview_panel.content = preview_content
+            self.preview_panel.update()
+        except Exception as e:
+            print(f"Ошибка при отображении превью: {e}")
+            # Показываем сообщение об ошибке в панели превью
+            self.preview_panel.content = ft.Column([
+                ft.Icon(ft.icons.ERROR, color=ft.colors.ERROR, size=32),
+                ft.Text("Ошибка при отображении превью документа",
+                       color=ft.colors.ERROR,
+                       weight=ft.FontWeight.BOLD),
+                ft.Text(str(e), color=ft.colors.ERROR, size=12),
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+            self.preview_panel.update()
+
+    def text_preview(self, document):
+        """Превью текстового документа"""
+        try:
+            with open(document.file_path, 'r', encoding='utf-8') as f:
+                content = f.read(1000)  # Читаем первую 1000 символов
+            return [
+                ft.Container(
+                    content=ft.Text(content + "..." if len(content) == 1000 else content),
+                    bgcolor=ft.colors.SURFACE_VARIANT,
+                    border_radius=5,
+                    padding=10
+                )
+            ]
+        except Exception as e:
+            return [ft.Text("Ошибка чтения файла", color=ft.colors.ERROR)]
+
+    def image_preview(self, document):
+        """Превью изображения"""
+        return [
+            ft.Container(
+                content=ft.Image(
+                    src=document.file_path,
+                    fit=ft.ImageFit.CONTAIN,
+                    border_radius=5,
+                ),
+                height=300,
+            )
+        ]
+
+    def pdf_preview(self, document):
+        """Превью PDF"""
+        return [
+            ft.Text("Предпросмотр PDF временно недоступен"),
+            ft.ElevatedButton(
+                "Открыть в программе просмотра",
+                icon=ft.icons.PICTURE_AS_PDF,
+                on_click=lambda _: self.open_document(document)
+            )
+        ]
+
+    def docx_preview(self, document):
+        """Превью DOCX"""
+        return [
+            ft.Text("Предпросмотр DOCX временно недоступен"),
+            ft.ElevatedButton(
+                "Открыть в программе просмотра",
+                icon=ft.icons.DESCRIPTION,
+                on_click=lambda _: self.open_document(document)
+            )
+        ]
+
+    def add_search_bar(self):
+        """Добавление поиска"""
+        def on_search_change(e):
+            search_term = search_field.value.lower()
+            self.filter_documents(search_term)
+        
+        search_field = ft.TextField(
+            label="Поиск документов",
+            prefix_icon=ft.icons.SEARCH,
+            on_change=on_search_change,
+            width=300
+        )
+        return search_field
+
+    def filter_documents(self, search_term: str):
+        """Фильтрация документов"""
+        if not search_term:
+            self.update_documents_list()
+            return
+        
+        search_term = search_term.lower()
+        self.document_list.controls.clear()
+        current_docs = self.documents.get(self.current_folder, [])
+        
+        for doc in current_docs:
+            if (search_term in doc.title.lower() or 
+                search_term in doc.description.lower() or
+                any(search_term in tag.lower() for tag in (doc.tags or []))):
+                self.document_list.controls.append(
+                    self.create_document_card(doc)
+                )
+        self.document_list.update()
+
+    def create_pdf_preview(self, pdf_path: str, max_pages: int = 1) -> ft.Image:
+        """Создание превью первой страницы PDF"""
+        try:
+            # Открываем PDF
+            pdf_document = fitz.open(pdf_path)
+            
+            if len(pdf_document) > 0:
+                # Берем первую страницу
+                page = pdf_document[0]
+                # Получаем изображение страницы
+                pix = page.get_pixmap(matrix=fitz.Matrix(0.5, 0.5))  # Уменьшаем размер для превью
+                
+                # Конвертируем в формат, который поддерживает Flet
+                img_bytes = pix.tobytes("png")
+                
+                # Создаем временный файл для изображения
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.png') as tmp_file:
+                    tmp_file.write(img_bytes)
+                    return tmp_file.name
+                    
+            pdf_document.close()
+            return None
+            
+        except Exception as e:
+            print(f"Ошибка при создании превью: {str(e)}")
+            return None
+
+    def show_pdf_preview(self, pdf_path: str):
+        """Показ диалога с превью PDF"""
+        preview_path = self.create_pdf_preview(pdf_path)
+        
+        if preview_path:
+            def close_dialog(e):
+                dialog.open = False
+                self.page.update()
+                
+            def open_pdf_file(e):
+                dialog.open = False
+                self.page.update()
+                self.open_pdf(pdf_path)
+                
+            dialog = ft.AlertDialog(
+                title=ft.Text("Предпросмотр PDF"),
+                content=ft.Column([
+                    ft.Image(
+                        src=preview_path,
+                        width=400,
+                        height=500,
+                        fit=ft.ImageFit.CONTAIN
+                    ),
+                ], scroll=ft.ScrollMode.AUTO),
+                actions=[
+                    ft.TextButton("Закрыть", on_click=close_dialog),
+                    ft.TextButton("Открыть PDF", on_click=open_pdf_file)
+                ]
+            )
+            
+            self.page.overlay.append(dialog)
+            dialog.open = True
+            self.page.update()
+        else:
+            self.show_error("Не удалось создать предпросмотр PDF")
+
+    def open_pdf(self, pdf_path: str):
+        """Открытие PDF файла"""
+        if os.path.exists(pdf_path):
+            import webbrowser
+            webbrowser.open(pdf_path)
+        else:
+            self.show_error("Файл не найден")
+
+    def create_document_card(self, doc: Document):
+        """Обновленная карточка документа с предпросмотром"""
+        return ft.Container(
+            content=ft.Column([
+                ft.Text(f"Название: {doc.title}", size=16, weight=ft.FontWeight.BOLD),
+                ft.Text(f"Описание: {doc.description}"),
+                ft.Text(f"Добавлено: {doc.date_added}"),
+                ft.Text(f"Статус: {doc.status}"),
+                ft.Text(f"Теги: {', '.join(doc.tags) if doc.tags else 'Нет тегов'}"),
+                ft.Row([
+                    ft.ElevatedButton(
+                        "Предпросмотр",
+                        icon=ft.icons.PREVIEW,
+                        on_click=lambda e, doc=doc: self.show_pdf_preview(doc.file_path)
+                    ),
+                    ft.ElevatedButton(
+                        "Открыть PDF",
+                        icon=ft.icons.FILE_OPEN,
+                        on_click=lambda e, doc=doc: self.open_pdf(doc.file_path)
+                    ),
+                    ft.ElevatedButton(
+                        "Удалить",
+                        icon=ft.icons.DELETE,
+                        on_click=lambda e, doc=doc: self.delete_document(doc)
+                    )
+                ])
+            ]),
+            padding=10,
+            border=ft.border.all(1, ft.colors.GREY_400),
+            border_radius=10
+        )
+
+    def add_document(self, e):
+        """Добавление документа с файлом"""
+        if not all([self.title_field.value, self.description_field.value]):
+            self.show_error("Заполните обязательные поля")
+            return
+        
+        if not self.selected_file_path:
+            self.show_error("Выберите PDF файл")
+            return
+        
+        # Создаем папку для файлов, если её нет
+        files_dir = Path("document_files")
+        files_dir.mkdir(exist_ok=True)
+        
+        # Копируем файл в папку приложения
+        file_name = Path(self.selected_file_path).name
+        new_file_path = files_dir / file_name
+        
+        try:
+            import shutil
+            shutil.copy2(self.selected_file_path, new_file_path)
+            
+            tags = [tag.strip() for tag in self.tags_field.value.split(',')] if self.tags_field.value else []
+            
+            doc = Document(
+                title=self.title_field.value,
+                description=self.description_field.value,
+                file_path=str(new_file_path),
+                date_added=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                status=self.status_dropdown.value,
+                tags=tags
+            )
+            
+            if self.current_folder not in self.documents:
+                self.documents[self.current_folder] = []
+            
+            self.documents[self.current_folder].append(doc)
+            self.update_documents_list()
+            self.clear_form()
+            self.show_snack_bar("Документ успешно добавлен")
+            
+        except Exception as e:
+            self.show_error(f"Ошибка при копировании файла: {str(e)}")
+
+    def clear_form(self):
+        """Очистка формы"""
+        self.title_field.value = ""
+        self.description_field.value = ""
+        self.tags_field.value = ""
+        self.status_dropdown.value = "Активный"
+        self.selected_file_path = None
+        self.selected_file_name.value = "Файл не выбран"
+        self.title_field.update()
+        self.description_field.update()
+        self.tags_field.update()
+        self.status_dropdown.update()
+        self.selected_file_name.update()
+
+    def update_documents_list(self):
+        """Обновление списка документов"""
+        try:
+            self.document_list.controls.clear()
+            
+            if self.current_folder is None or self.current_folder not in self.documents:
+                return
+            
+            documents = self.documents[self.current_folder]
+            try:
+                sorted_docs = sorted(documents, key=lambda x: x.name if hasattr(x, 'name') else '')
+                for doc in sorted_docs:
+                    self.document_list.controls.append(self.create_document_item(doc))
+            except AttributeError as e:
+                print(f"Ошибка при сортировке документов: {e}")
+                # Если возникла ошибка сортировки, показываем документы без сортировки
+                for doc in documents:
+                    self.document_list.controls.append(self.create_document_item(doc))
+            
+            self.document_list.update()
+        except Exception as e:
+            print(f"Ошибка при обновлении списка документов: {e}")
+
+    def delete_document(self, doc: Document):
+        def confirm_delete(e):
+            current_docs = self.documents.get(self.current_folder, [])
+            current_docs.remove(doc)
+            self.update_documents_list()
+            dialog.open = False
+            self.page.update()
+            self.show_snack_bar("Документ успешно удален")
+        
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Подтверждение"),
+            content=ft.Text("Вы уверены, что хотите удалить этот документ?"),
+            actions=[
+                ft.TextButton("Отмена", on_click=lambda e: setattr(dialog, 'open', False)),
+                ft.TextButton("Уалить", on_click=confirm_delete)
+            ]
+        )
+        
+        self.page.overlay.append(dialog)
+        dialog.open = True
+        self.page.update()
+
+    def show_snack_bar(self, message: str):
+        """Показ уведомления"""
+        snack = ft.SnackBar(content=ft.Text(message))
+        self.page.overlay.append(snack)
+        snack.open = True
+        self.page.update()
+
+    def select_folder(self, folder_path: str):
+        """Выбор папки"""
+        # Обновляем текущую папку
+        self.current_folder = folder_path
+        # Обновляем дерево папок для отображения выделения
+        self.update_folder_tree()
+        # Обновляем список документов
+        self.update_documents_list()
+        self.page.update()
+
+    def add_export_button(self):
+        def export_to_file(e):
+            current_docs = self.documents.get(self.current_folder, [])
+            if not current_docs:
+                self.show_error("Нет документов для экспорта")
+                return
+            
+            export_text = "Список документов:\n\n"
+            for doc in current_docs:
+                export_text += f"Название: {doc.title}\n"
+                export_text += f"Описание: {doc.description}\n"
+                export_text += f"Статус: {doc.status}\n"
+                export_text += f"Дата: {doc.date_added}\n"
+                export_text += f"Теги: {', '.join(doc.tags) if doc.tags else 'Нет'}\n"
+                export_text += "-" * 50 + "\n"
+            
+            with open("documents_export.txt", "w", encoding="utf-8") as f:
+                f.write(export_text)
+            
+            self.show_snack_bar("Документы экспортированы в файл documents_export.txt")
+        
+        return ft.ElevatedButton(
+            "Экспорт документов",
+            icon=ft.icons.DOWNLOAD,
+            on_click=export_to_file
+        )
+
+    def add_sort_dropdown(self):
+        def on_sort_change(e):
+            sort_type = e.control.value
+            current_docs = self.documents.get(self.current_folder, [])
+            
+            if sort_type == "По названию":
+                current_docs.sort(key=lambda x: x.title)
+            elif sort_type == "По дате":
+                current_docs.sort(key=lambda x: x.date_added, reverse=True)
+            elif sort_type == "По статусу":
+                current_docs.sort(key=lambda x: x.status)
+            
+            self.update_documents_list()
+        
+        return ft.Dropdown(
+            label="Сортировка",
+            width=200,
+            options=[
+                ft.dropdown.Option("По названию"),
+                ft.dropdown.Option("По дате"),
+                ft.dropdown.Option("По статусу")
+            ],
+            on_change=on_sort_change
+        )
+
+    def add_status_filter(self):
+        def on_filter_change(e):
+            status = e.control.value
+            if status == "Все":
+                self.update_documents_list()
+                return
+            
+            self.document_list.controls.clear()
+            current_docs = self.documents.get(self.current_folder, [])
+            
+            for doc in current_docs:
+                if doc.status == status:
+                    self.document_list.controls.append(
+                        self.create_document_card(doc)
+                    )
+            self.document_list.update()
+        
+        return ft.Dropdown(
+            label="Фильтр по статусу",
+            width=200,
+            options=[ft.dropdown.Option("Все")] + 
+                    [ft.dropdown.Option(status) for status in self.statuses],
+            value="Все",
+            on_change=on_filter_change
+        )
+
+    def on_file_picked(self, e: ft.FilePickerResultEvent):
+        """Обработка выбора файла с предпросмотром"""
+        if e.files and len(e.files) > 0:
+            file = e.files[0]
+            if file.path.lower().endswith('.pdf'):
+                self.selected_file_path = file.path
+                self.selected_file_name.value = file.name
+                self.selected_file_name.update()
+                
+                # Показываем предпромотр выбранного файла
+                self.show_pdf_preview(file.path)
+            else:
+                self.show_error("Пожалуйста, выберите PDF файл")
+                self.selected_file_path = None
+                self.selected_file_name.value = "Файл не выбран"
+                self.selected_file_name.update()
+
+    def add_root_folder_dialog(self):
+        """Диалог создания новой корневой папки верхнего уровня"""
+        def close_dialog(e):
+            dialog.open = False
+            self.page.update()
+
+        def create_root_folder(e):
+            folder_name = folder_name_field.value.strip()
+            if not folder_name:
+                self.show_error("Введите мя папки")
+                return
+            
+            # Создаем путь для новой корневой папки
+            new_path = f"/{folder_name}"
+            
+            if new_path in self.folders:
+                self.show_error("Папка с таким именем уже существует")
+                return
+            
+            # Создаем новую корневую папку
+            self.folders[new_path] = {
+                "name": folder_name,
+                "subfolders": set()
+            }
+            
+            dialog.open = False
+            self.page.update()
+            self.update_folder_tree()
+            self.show_snack_bar(f"Создана новая корневая папка '{folder_name}'")
+
+        folder_name_field = ft.TextField(
+            label="Название корневой папки",
+            width=300,
+            autofocus=True
+        )
+        
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Создать новую корневую папку"),
+            content=ft.Column([folder_name_field]),
+            actions=[
+                ft.TextButton("Отмена", on_click=close_dialog),
+                ft.TextButton("Создать", on_click=create_root_folder)
+            ],
+            actions_alignment=ft.MainAxisAlignment.END
+        )
+        
+        self.page.overlay.append(dialog)
+        dialog.open = True
+        self.page.update()
+
+    def add_folder_dialog(self, parent_path=None):
+        """Диалог создания новой подпапки"""
+        if parent_path is None:
+            parent_path = self.current_folder
+
+        def close_dialog(e):
+            dialog.open = False
+            self.page.update()
+
+        def create_folder(e):
+            folder_name = folder_name_field.value.strip()
+            if not folder_name:
+                self.show_error("Введите имя папки")
+                return
+            
+            # Создаем путь для новой папки
+            new_path = f"{parent_path}/{folder_name}".replace("//", "/")
+            
+            if new_path in self.folders:
+                self.show_error("Папка с таким именем уже существует")
+                return
+            
+            # Создаем новую папку
+            self.folders[new_path] = {
+                "name": folder_name,
+                "subfolders": set()
+            }
+            
+            # Добавляем в подпапки родителя
+            if parent_path in self.folders:
+                self.folders[parent_path]["subfolders"].add(new_path)
+            
+            # Автоматически разворачиваем родительскую папку
+            self.folder_tree.expanded_paths.add(parent_path)
+            
+            dialog.open = False
+            self.page.update()
+            self.update_folder_tree()
+            self.show_snack_bar(f"Папка '{folder_name}' создана")
+
+        folder_name_field = ft.TextField(
+            label="Имя папки",
+            width=300,
+            autofocus=True
+        )
+        
+        parent_name = self.folders[parent_path]["name"]
+        
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"Создать новую папку в '{parent_name}'"),
+            content=ft.Column([folder_name_field]),
+            actions=[
+                ft.TextButton("Отмена", on_click=close_dialog),
+                ft.TextButton("Создать", on_click=create_folder)
+            ],
+            actions_alignment=ft.MainAxisAlignment.END
+        )
+        
+        self.page.overlay.append(dialog)
+        dialog.open = True
+        self.page.update()
+
+    def update_folder_tree(self):
+        """Обновление дерева папок"""
+        def build_tree() -> list:
+            items = []
+            root_folders = {path: info for path, info in self.folders.items() 
+                           if "/" not in path[1:]}
+            
+            for path, info in sorted(root_folders.items(), key=lambda x: x[1]["name"]):
+                items.append(self.folder_tree.create_folder_item(
+                    info["name"],
+                    path,
+                    is_root=True,
+                    level=0
+                ))
+                
+                if path in self.folder_tree.expanded_paths:
+                    items.extend(build_subtree(path, level=1))
+            
+            return items
+
+        def build_subtree(path: str, level: int) -> list:
+            items = []
+            folder = self.folders.get(path, {"subfolders": []})
+            
+            for subfolder in sorted(folder["subfolders"], 
+                                  key=lambda x: self.folders[x]["name"]):
+                items.append(self.folder_tree.create_folder_item(
+                    self.folders[subfolder]["name"],
+                    subfolder,
+                    is_root=False,
+                    level=level
+                ))
+                
+                if subfolder in self.folder_tree.expanded_paths:
+                    items.extend(build_subtree(subfolder, level + 1))
+            
+            return items
+
+        self.folder_list.controls = build_tree()
+        self.folder_list.update()
+
+    def main(self, page: ft.Page):
+        self.page = page
+        page.title = "AVS-Архив"
+        self.show_login_dialog()
+
+    def rename_folder_dialog(self, folder_path: str):
+        """Диалог переименования папки"""
+        def close_dialog(e):
+            dialog.open = False
+            self.page.update()
+
+        def rename_folder(e):
+            new_name = name_field.value.strip()
+            if not new_name:
+                self.show_error("Введите имя папки")
+                return
+            
+            # Создаем новый путь
+            parent_path = "/".join(folder_path.split("/")[:-1])
+            if not parent_path:
+                parent_path = "/"
+            new_path = f"{parent_path}/{new_name}".replace("//", "/")
+            
+            if new_path in self.folders and new_path != folder_path:
+                self.show_error("Папка с таким именем уже существует")
+                return
+            
+            # Сохраняем информацию о папке
+            folder_info = self.folders[folder_path].copy()
+            folder_info["name"] = new_name
+            
+            # Обновляем пути во всех подпапках
+            old_prefix = folder_path + "/"
+            subfolders_to_update = {}
+            
+            for path, info in list(self.folders.items()):
+                if path.startswith(old_prefix):
+                    new_subfolder_path = new_path + path[len(folder_path):]
+                    subfolders_to_update[new_subfolder_path] = info
+                    
+                    # Обновляем ссылки в родительских папках
+                    parent = "/".join(path.split("/")[:-1])
+                    if parent in self.folders:
+                        self.folders[parent]["subfolders"].remove(path)
+                        self.folders[parent]["subfolders"].add(new_subfolder_path)
+            
+            # Обновляем пути в expanded_paths
+            if folder_path in self.folder_tree.expanded_paths:
+                self.folder_tree.expanded_paths.remove(folder_path)
+                self.folder_tree.expanded_paths.add(new_path)
+            
+            # Обновляем ссылку в родительской папке
+            if parent_path in self.folders:
+                self.folders[parent_path]["subfolders"].remove(folder_path)
+                self.folders[parent_path]["subfolders"].add(new_path)
+            
+            # Удаляем старую папку и добавляем новую
+            del self.folders[folder_path]
+            self.folders[new_path] = folder_info
+            
+            # Добавляем обновленные подпапки
+            self.folders.update(subfolders_to_update)
+            
+            # Обновляем текущую папку, если это она была переименована
+            if self.current_folder == folder_path:
+                self.current_folder = new_path
+            
+            dialog.open = False
+            self.page.update()
+            self.update_folder_tree()
+            self.show_snack_bar(f"Папка переименована в '{new_name}'")
+
+        name_field = ft.TextField(
+            label="Новое имя папки",
+            value=self.folders[folder_path]["name"],
+            width=300,
+            autofocus=True
+        )
+        
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Переименовать папку"),
+            content=ft.Column([name_field]),
+            actions=[
+                ft.TextButton("Отмена", on_click=close_dialog),
+                ft.TextButton("Переименовать", on_click=rename_folder)
+            ],
+            actions_alignment=ft.MainAxisAlignment.END
+        )
+        
+        self.page.overlay.append(dialog)
+        dialog.open = True
+        self.page.update()
+
+    def delete_folder_dialog(self, folder_path: str):
+        """Диалог удаления папки"""
+        def close_dialog(e):
+            dialog.open = False
+            self.page.update()
+
+        def delete_folder(e):
+            # Проверяем наличие документов
+            if folder_path in self.documents and self.documents[folder_path]:
+                self.show_error("Нельзя удалить папку с документами")
+                return
+                
+            # Проверяем наличие подпапок
+            if self.folders[folder_path]["subfolders"]:
+                self.show_error("Нельзя удалить папку с подпапками")
+                return
+                
+            # Получаем родительский путь
+            parent_path = "/".join(folder_path.split("/")[:-1])
+            if not parent_path:
+                parent_path = "/"
+            
+            # Удаляем папку из родительской папки
+            if parent_path in self.folders:
+                self.folders[parent_path]["subfolders"].remove(folder_path)
+            
+            # Удаляем саму папку
+            del self.folders[folder_path]
+            if folder_path in self.documents:
+                del self.documents[folder_path]
+                
+            # Если удаляем текущую папку, переходим в родительскую
+            if self.current_folder == folder_path:
+                self.current_folder = parent_path
+            
+            dialog.open = False
+            self.page.update()
+            self.update_folder_tree()
+            self.show_snack_bar("Папка удалена")
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Удалить папку?"),
+            content=ft.Column([
+                ft.Text("Вы уверены, что хо��ите удалить эту папку?"),
+                ft.Text("Имя папки: " + self.folders[folder_path]["name"], 
+                       color=ft.colors.RED_400),
+            ]),
+            actions=[
+                ft.TextButton("Отмена", on_click=close_dialog),
+                ft.TextButton("Удалить", 
+                            on_click=delete_folder,
+                            style=ft.ButtonStyle(
+                                color=ft.colors.RED_400
+                            ))
+            ],
+            actions_alignment=ft.MainAxisAlignment.END
+        )
+        
+        self.page.overlay.append(dialog)
+        dialog.open = True
+        self.page.update()
+
+    def show_folder_menu(self, e, folder_path: str):
+        """Показать меню папки"""
+        def close_menu(e):
+            menu.open = False
+            self.page.update()
+
+        def rename_action(e):
+            menu.open = False
+            self.page.update()
+            self.rename_folder_dialog(folder_path)
+
+        def delete_action(e):
+            menu.open = False
+            self.page.update()
+            self.delete_folder_dialog(folder_path)
+
+        def add_subfolder_action(e):
+            menu.open = False
+            self.page.update()
+            self.add_folder_dialog(parent_path=folder_path)
+
+        # Определяем, является ли папка корневой
+        is_root = folder_path == "/"
+
+        menu_items = []
+
+        # Для всех папок добавляем возможность создания подпапки
+        menu_items.append(
+            ft.TextButton(
+                "Добавить подпапку",
+                icon=ft.icons.CREATE_NEW_FOLDER,
+                on_click=add_subfolder_action
+            )
+        )
+
+        # Для некорневых папок добавляем возможность переименования и удаления
+        if not is_root:
+            menu_items.extend([
+                ft.TextButton(
+                    "Переименовать",
+                    icon=ft.icons.EDIT,
+                    on_click=rename_action
+                ),
+                ft.TextButton(
+                    "Удалить",
+                    icon=ft.icons.DELETE,
+                    on_click=delete_action,
+                    disabled=bool(self.folders[folder_path]["subfolders"])
+                ),
+            ])
+
+        menu = ft.AlertDialog(
+            modal=True,
+            title=ft.Text(f"Действия с папкой '{self.folders[folder_path]['name']}'"),
+            content=ft.Column(menu_items, spacing=10),
+            actions=[
+                ft.TextButton("Закрыть", on_click=close_menu)
+            ]
+        )
+        
+        self.page.overlay.append(menu)
+        menu.open = True
+        self.page.update()
+
+    def update_folder_hover(self, e, path: str):
+        """Обновление hover эффекта папки"""
+        if e.data == "true":  # Мышь наведена
+            self.hovered_folder = path
+        else:  # Мышь убрана
+            self.hovered_folder = None
+        self.update_folder_tree()
+
+    def add_document_dialog(self):
+        """Диалог добавления нового документа"""
+        def close_dialog(e):
+            dialog.open = False
+            self.page.update()
+
+        def pick_files(e):
+            file_picker = ft.FilePicker(
+                on_result=handle_file_pick
+            )
+            self.page.overlay.append(file_picker)
+            self.page.update()
+            file_picker.pick_files(
+                allow_multiple=False,
+                file_type=ft.FilePickerFileType.ANY,
+                allowed_extensions=["pdf", "doc", "docx", "txt", "rtf", "jpg", "jpeg", "png"]
+            )
+
+        def handle_file_pick(e):
+            if e.files:
+                file_info = e.files[0]
+                file_path_field.value = file_info.path
+                file_name = os.path.basename(file_info.path)
+                if not name_field.value:  # Если имя документа не задано, используем имя файла
+                    name_field.value = os.path.splitext(file_name)[0]
+                dialog.update()
+
+        def add_document(e):
+            name = name_field.value.strip()
+            file_path = file_path_field.value.strip()
+            
+            if not name:
+                self.show_error("Введите название документа")
+                return
+
+            if not file_path:
+                self.show_error("Прикрепите файл документа")
+                return
+
+            # Проверяем, выбрана ли папка
+            if not self.current_folder:
+                self.show_error("Выберите папку для добавления документа")
+                return
+
+            # Создаем новый документ
+            new_document = Document(
+                name,
+                file_path,
+                "Активный",
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                self.current_user.username if self.current_user else "Unknown"
+            )
+
+            # Добавляем документ в текущую папку
+            if self.current_folder not in self.documents:
+                self.documents[self.current_folder] = []
+            self.documents[self.current_folder].append(new_document)
+
+            dialog.open = False
+            self.page.update()
+            self.update_documents_list()
+            self.show_snack_bar(f"Документ '{name}' создан")
+
+        name_field = ft.TextField(
+            label="Название документа",
+            width=300,
+            autofocus=True
+        )
+
+        file_path_field = ft.TextField(
+            label="Путь к файлу",
+            width=300,
+            read_only=True,
+            suffix=ft.IconButton(
+                icon=ft.icons.ATTACH_FILE,
+                on_click=pick_files,
+                tooltip="Прикрепить файл"
+            )
+        )
+
+        dialog = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Добавить новый документ"),
+            content=ft.Column([
+                name_field,
+                file_path_field,
+                ft.Row([
+                    ft.Text(
+                        "Поддерживаемые форматы:",
+                        size=12,
+                        color=ft.colors.GREY_500
+                    ),
+                    ft.Text(
+                        "PDF, DOC, DOCX, TXT, RTF, JPG, JPEG, PNG",
+                        size=12,
+                        color=ft.colors.BLUE
+                    )
+                ]),
+                ft.Text(
+                    "Документ будет добавлен в текущую папку",
+                    size=12,
+                    color=ft.colors.GREY_500
+                )
+            ]),
+            actions=[
+                ft.TextButton("Отмена", on_click=close_dialog),
+                ft.TextButton("Добавить", on_click=add_document)
+            ],
+            actions_alignment=ft.MainAxisAlignment.END
+        )
+
+        self.page.overlay.append(dialog)
+        dialog.open = True
+        self.page.update()
+
+    def create_document_item(self, doc):
+        """Создание элемента документа"""
+        try:
+            file_name = os.path.basename(doc.file_path) if hasattr(doc, 'file_path') and doc.file_path else "Нет файла"
+            file_ext = os.path.splitext(file_name)[1].lower() if doc.file_path else ""
+            
+            # Выбор иконки в зависимости от типа файла
+            icon = ft.icons.DESCRIPTION
+            if file_ext in ['.jpg', '.jpeg', '.png']:
+                icon = ft.icons.IMAGE
+            elif file_ext == '.pdf':
+                icon = ft.icons.PICTURE_AS_PDF
+            elif file_ext in ['.doc', '.docx']:
+                icon = ft.icons.ARTICLE
+
+            return ft.Container(
+                content=ft.Row([
+                    ft.Icon(icon),
+                    ft.Text(doc.name if hasattr(doc, 'name') else 'Без названия', 
+                           weight=ft.FontWeight.BOLD),
+                    ft.Container(
+                        content=ft.Text(file_name, size=12),
+                        bgcolor=ft.colors.SURFACE_VARIANT,
+                        padding=5,
+                        border_radius=3
+                    ),
+                    ft.Text(doc.created_date if hasattr(doc, 'created_date') else '', 
+                           size=12, color=ft.colors.GREY_500),
+                ], spacing=10),
+                padding=10,
+                border_radius=5,
+                ink=True,
+                on_click=lambda e: self.show_preview(doc) if hasattr(self, 'show_preview') else None
+            )
+        except Exception as e:
+            print(f"Ошибка при создании элемента документа: {e}")
+            # Возвращаем запасной вариант в случае ошибки
+            return ft.Container(
+                content=ft.Row([
+                    ft.Icon(ft.icons.ERROR),
+                    ft.Text("шибка отображения документа", 
+                           color=ft.colors.ERROR),
+                ]),
+                padding=10,
+                border_radius=5
+            )
+
+if __name__ == "__main__":
+    app = ArchiveApp()
+    ft.app(target=app.main)
